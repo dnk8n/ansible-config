@@ -1,0 +1,316 @@
+---
+
+- name: Ensure firewall set up correctly
+  hosts: all
+  become: yes
+  vars:
+    firewall_state: started
+    firewall_enabled_at_boot: true
+    firewall_allowed_tcp_ports:
+      - 22
+      - 25
+      - 80
+      - 443
+    firewall_allowed_udp_ports: []
+    firewall_disable_ufw: true
+    firewall_enable_ipv6: false
+  roles:
+    # ansible-galaxy install geerlingguy.firewall
+    - geerlingguy.firewall
+
+- name: Ensure Docker is installed
+  hosts: writeinpublic-test
+  become: yes
+  vars:
+    docker_package_state: latest
+    docker_users:
+      - dean
+  roles:
+    # ansible-galaxy install geerlingguy.docker
+    - role: geerlingguy.docker
+
+- name: Ensure Docker Python library is installed
+  hosts: all
+  become: yes
+  vars:
+    pip_executable: pip3
+    pip_package: python3-pip
+    pip_install_packages:
+      - name: docker
+        state: latest
+  roles:
+    # ansible-galaxy install geerlingguy.pip
+    - role: geerlingguy.pip
+
+- name: Manage Deployment
+  hosts: writeinpublic-test
+  become: no
+  tasks:
+    - name: Write-in-Public Network exists
+      tags:
+        - deployment
+      docker_network:
+        name: writeinpublic
+        state: present
+
+#    - name: "Openup Elasticsearch 0.90.13 container exists"
+#      docker_container:
+#        image: openup/elasticsearch-0.90:latest
+
+# Shouldn't be needed once image is pulled from container registry
+    - name: Writeinpublic repo exists
+      tags:
+        - deployment
+        - deployment-writeinpublic
+      git:
+        repo: https://github.com/dnk8n/writeinpublic.git
+        dest: /home/dean/src/writeinpublic
+        version: local_devops
+
+    - name: Writeinpublic image exists and is the correct version
+      tags:
+        - deployment
+        - deployment-writeinpublic
+      docker_image:
+        build:
+          path: /home/dean/src/writeinpublic
+          pull: yes
+        name: openup/writeinpublic
+        tag: latest
+        state: present
+        source: build
+        force_source: yes
+
+#    - name: "Run Write in Public tests and write out coverage analysis"
+
+#    - name: "Compile all the available Write in public translations"
+
+    - name: Local Settings are present and owned by 1000:1000 (container user uid:gid)
+      tags:
+        - deployment
+        - deployment-writeinpublic
+      become: yes
+      file:
+        path: /home/dean/local_settings.py
+        owner: "1000"
+        group: "1000"
+        mode: "0600"
+
+    - name: App directory to be used as shared volume exists and is owned by 1000:1000 (container user uid:gid)
+      tags:
+        - deployment
+      become: yes
+      file:
+        path: /home/dean/share
+        state: directory
+        owner: "1000"
+        group: "1000"
+        mode: "0755"
+
+    - name: RabbitMQ server container is started
+      tags:
+        - deployment
+      docker_container:
+        name: rabbitmq
+        hostname: rabbitmq
+        image: rabbitmq:3.8.3
+        restart_policy: unless-stopped
+
+    - name: Run migrations
+      tags:
+        - deployment
+        - deployment-writeinpublic
+      docker_container:
+        user: "1000:1000"
+        name: writeinpublic-migrations
+        state: started
+        image: openup/writeinpublic:latest
+        working_dir: /app
+        command: ./manage.py migrate
+        volumes:
+          - /home/dean/local_settings.py:/app/writeit/local_settings.py
+          - /home/dean/share:/app/share
+        detach: false
+      ignore_errors: yes
+      register: migrations
+
+    - name: Show output for migrations
+      tags:
+        - deployment
+        - deployment-writeinpublic
+      debug:
+        msg: "{{ migrations.ansible_facts.docker_container.Output }}"
+
+    - name: Remove the migrations container
+      tags:
+        - deployment
+        - deployment-writeinpublic
+      docker_container:
+        state: absent
+        name: writeinpublic-migrations
+
+    - name: Run collectstatic
+      tags:
+        - deployment
+        - deployment-writeinpublic
+      docker_container:
+        user: "1000:1000"
+        name: writeinpublic-collectstatic
+        state: started
+        image: openup/writeinpublic:latest
+        working_dir: /app
+        command: ./manage.py collectstatic --noinput
+        volumes:
+          - /home/dean/local_settings.py:/app/writeit/local_settings.py
+          - /home/dean/share:/app/share
+        detach: false
+      ignore_errors: yes
+      register: collectstatic
+
+    - name: Show output for collectstatic
+      tags:
+        - deployment
+        - deployment-writeinpublic
+      debug:
+        msg: "{{ collectstatic.ansible_facts.docker_container.Output }}"
+
+    - name: Remove the collectstatic container
+      tags:
+        - deployment
+        - deployment-writeinpublic
+      docker_container:
+        state: absent
+        name: writeinpublic-collectstatic
+
+#    - name: Load Fixtures
+#      docker_container:
+#        user: "1000:1000"
+#        name: writeinpublic-fixtures
+#        state: started
+#        image: openup/writeinpublic:latest
+#        working_dir: /app
+#        command: ./manage.py loaddata example_data.yaml
+#        volumes:
+#          - /home/dean/local_settings.py:/app/writeit/local_settings.py
+#          - /home/dean/share:/app/share
+#        detach: false
+#      ignore_errors: yes
+#      register: fixtures
+#
+#    - name: Show output for fixtures
+#      debug:
+#        msg: "{{ fixtures.ansible_facts.docker_container.Output }}"
+#
+#    - name: Remove the fixtures container
+#      docker_container:
+#        state: absent
+#        name: writeinpublic-fixtures
+
+    - name: Writeinpublic container is started - writeinpublic
+      tags:
+        - deployment
+        - deployment-writeinpublic
+      docker_container:
+        user: "1000:1000"
+        name: writeinpublic
+        hostname: writeinpublic
+        state: started
+        image: openup/writeinpublic:latest
+        working_dir: /app
+        command: gunicorn -b 0.0.0.0:8000 writeit.wsgi
+        restart_policy: unless-stopped
+        env:
+          BROKER_URL: "amqp://guest:guest@rabbitmq//"
+          CELERY_BROKER_URL: "amqp://guest:guest@rabbitmq//"
+        volumes:
+          - /home/dean/local_settings.py:/app/writeit/local_settings.py
+          - /home/dean/share:/app/share
+
+    - name: Writeinpublic container is started - writeinpublic-celery_worker
+      tags:
+        - deployment
+      docker_container:
+        user: "1000:1000"
+        name: writeinpublic-celery_worker
+        state: started
+        image: openup/writeinpublic:latest
+        working_dir: /app
+        command: celery -A writeit worker
+        restart_policy: unless-stopped
+        env:
+          BROKER_URL: "amqp://guest:guest@rabbitmq//"
+          CELERY_BROKER_URL: "amqp://guest:guest@rabbitmq//"
+        volumes:
+          - /home/dean/local_settings.py:/app/writeit/local_settings.py
+          - /home/dean/share:/app/share
+
+    - name: Writeinpublic container is started - writeinpublic-celery_beat
+      tags:
+        - deployment
+      docker_container:
+        user: "1000:1000"
+        name: writeinpublic-celery_beat
+        state: started
+        image: openup/writeinpublic:latest
+        command: celery -A writeit beat
+        restart_policy: unless-stopped
+        env:
+          BROKER_URL: "amqp://guest:guest@rabbitmq//"
+          CELERY_BROKER_URL: "amqp://guest:guest@rabbitmq//"
+        volumes:
+          - /home/dean/local_settings.py:/app/writeit/local_settings.py
+          - /home/dean/share:/app/share
+
+    - name: Caddyfile directory exists
+      tags:
+        - deployment
+      file:
+        path: /home/dean/.caddy
+        state: directory
+        mode: 0755
+
+    - name: Caddyfile exists
+      tags:
+        - deployment
+      template:
+        src: Caddyfile
+        dest: /home/dean/.caddy/Caddyfile
+        mode: 0644
+      register: caddyfile
+
+    - name: Caddy container exists
+      tags:
+        - deployment
+      docker_container:
+        user: root
+        name: caddy
+        state: started
+        image: caddy/caddy:v2.0.0-beta.15-alpine
+        pull: yes
+        ports:
+          - 80:80
+          - 443:443
+        restart_policy: unless-stopped
+        restart: "{{ 'yes' if caddyfile.changed else 'no' }}"
+        env:
+          ACME_AGREE: "true"
+          XDG_DATA_HOME: "/root/.local/share"
+        volumes:
+          - /home/dean/.caddy/Caddyfile:/etc/caddy/Caddyfile
+          - /home/dean/.caddy/data:/data
+          - /home/dean/.caddy/config:/config
+          - /home/dean/.caddy/share/.local:/root/.local/share
+          - /home/dean/.caddy/share/usr:/usr/share/caddy
+
+    - name: Ensure only necessary containers added to network
+      tags:
+        - deployment
+        - deployment-writeinpublic
+      docker_network:
+        name: network_one
+        connected:
+          - caddy
+          - writeinpublic
+          - writeinpublic-celery_worker
+          - writeinpublic-celery_beat
+          - rabbitmq
